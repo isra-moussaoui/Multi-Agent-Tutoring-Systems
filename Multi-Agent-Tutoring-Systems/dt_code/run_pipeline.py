@@ -83,7 +83,7 @@ VERDICT_TO_LABEL = {
 }
 
 
-def run_tutor(row, student_parsed, provider, model, sleep_s, temperature=0.2, max_tokens=1536):
+def run_tutor(row, student_parsed, provider, model, sleep_s, temperature=0.2, max_tokens=3072):
     givens = row["Givens"]
     intermediates = row["Intermediates"]["Expressions"]
     conclusion = row["Conclusion"]
@@ -98,7 +98,7 @@ def run_tutor(row, student_parsed, provider, model, sleep_s, temperature=0.2, ma
     return parsed, raw
 
 
-def run_verifier(row, student_parsed, provider, model, sleep_s, temperature=0.2, max_tokens=1536):
+def run_verifier(row, student_parsed, provider, model, sleep_s, temperature=0.2, max_tokens=3072):
     """Independent audit -- deliberately takes no tutor_verdict argument.
     There is nothing to pass: the Verifier must never see the Tutor's output."""
     givens = row["Givens"]
@@ -117,7 +117,7 @@ def run_verifier(row, student_parsed, provider, model, sleep_s, temperature=0.2,
 
 def run_recovery(row, student_parsed, tutor_verdict, tutor_feedback,
                   verifier_verdict, verifier_feedback,
-                  provider, model, sleep_s, temperature=0.2, max_tokens=1536):
+                  provider, model, sleep_s, temperature=0.2, max_tokens=3072):
     givens = row["Givens"]
     intermediates = row["Intermediates"]["Expressions"]
     conclusion = row["Conclusion"]

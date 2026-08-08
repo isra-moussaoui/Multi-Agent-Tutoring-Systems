@@ -56,13 +56,28 @@ def _render(entry, variables):
 
 
 def student_prompt(givens, intermediates, conclusion):
-    """Original student_prompt from the repo, used unmodified."""
+    """
+    BUGFIX (found while debugging why the Student always said 'Insufficient
+    information'): the YAML's 'variables:' block (GIVENS/INTERMEDIATE_STEPS/
+    CONCLUSION placeholders) is never read by _render() -- _render() only
+    pulls text from role/Step_by_Step_Instructions/Constraints/Response_Format,
+    and none of those sections contain a literal "{givens}" placeholder to
+    substitute into. So the rendered prompt never actually told the Student
+    what the problem was. Fixed the same way blind_tutor_prompt/verifier_prompt
+    already do it: explicitly append the problem data after rendering.
+    """
     entry = _PROMPTS["student_prompt"]
-    return _render(entry, {
+    text = _render(entry, {
         "givens": givens,
         "intermediates": intermediates,
         "conclusion": conclusion,
     })
+    text += (
+        f"\n\nGIVENS: {givens}"
+        f"\nINTERMEDIATE_STEPS: {intermediates}"
+        f"\nCONCLUSION: {conclusion}"
+    )
+    return text
 
 
 # ---------------------------------------------------------------------------

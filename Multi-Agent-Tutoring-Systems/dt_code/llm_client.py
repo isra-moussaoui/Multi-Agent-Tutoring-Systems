@@ -21,6 +21,7 @@ student simulator + Tutor, Gemini for the Verifier once you build Step 4).
 """
 
 import os
+import re
 import time
 import json
 import requests
@@ -62,7 +63,23 @@ def _is_daily_quota_error(resp_text):
             or " tpd" in t or " rpd" in t or "daily" in t)
 
 
-def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=1536, retries=3):
+def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=2048, retries=3):
+    """
+    BUGFIX: openai/gpt-oss-20b and gpt-oss-120b are reasoning models. On Groq
+    they spend part of the token budget on hidden chain-of-thought (returned
+    separately in a `reasoning` field), and only write the final answer into
+    `content` once reasoning finishes. With a low max_tokens and no cap on
+    reasoning effort, the model can burn the ENTIRE budget on reasoning and
+    never get to write `content` at all -- which returns as "", not
+    malformed JSON. That's why extract_json_object was getting a bare empty
+    string for these models specifically.
+
+    Fix: explicitly cap reasoning_effort="low" for gpt-oss models (Groq
+    supports low/medium/high, see console.groq.com/docs/reasoning) so less
+    of the budget goes to hidden thinking, and raise the default max_tokens
+    as a safety margin. qwen models use reasoning_effort differently
+    (none/default) so we don't set it for those.
+    """
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise LLMError("GROQ_API_KEY is not set. Get a free key at https://console.groq.com")
@@ -74,13 +91,29 @@ def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=153
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"
 
     last_err = None
     for attempt in range(retries):
         resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=60)
         if resp.status_code == 200:
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"]["content"]
+            if not content:
+                # Content came back genuinely empty -- almost always means
+                # reasoning consumed the whole max_tokens budget for a
+                # gpt-oss model. Surface this distinctly from a normal parse
+                # failure so it's easy to diagnose from the failures log.
+                finish_reason = data["choices"][0].get("finish_reason")
+                reasoning_preview = (data["choices"][0]["message"].get("reasoning") or "")[:200]
+                raise LLMError(
+                    f"Groq returned empty content (finish_reason={finish_reason}) -- "
+                    f"likely ran out of max_tokens during reasoning before writing the "
+                    f"final answer. Consider raising max_tokens or lowering reasoning_effort "
+                    f"further. Reasoning preview: {reasoning_preview!r}"
+                )
+            return content
         if resp.status_code == 429:
             if _is_daily_quota_error(resp.text):
                 # This is a per-day cap (e.g. "100000 tokens per day" for this
@@ -150,6 +183,17 @@ def extract_json_object(text):
     """
     Same robust extraction logic as dt_code/llm_response_processing/response_preprocess.py
     -- handles raw JSON, ```json fenced blocks, or JSON embedded in extra text.
+
+    BUGFIX: reasoning models (e.g. qwen/qwen3.6-27b) wrap their answer in
+    <think>...</think> before the actual JSON. Their thinking text very often
+    contains stray '{'/'}' characters -- e.g. when the model quotes the
+    Response_Format template back to itself while reasoning about it, or
+    writes example JSON mid-thought. The old greedy regex (searching from the
+    first '{' to the last '}') would match from the FIRST '{' anywhere in
+    the text (often inside
+    <think>) to the LAST '}' (the real answer), swallowing everything in
+    between into one invalid blob. Stripping <think> blocks first removes
+    that noise before the regex ever runs.
     """
     if not text:
         return None
@@ -157,6 +201,11 @@ def extract_json_object(text):
         return text
 
     s = text.strip()
+
+    # Strip <think>...</think> reasoning blocks (case-insensitive, may span
+    # multiple lines) before attempting any parse below.
+    s = re.sub(r"<think>[\s\S]*?</think>", "", s, flags=re.IGNORECASE).strip()
+
     try:
         return json.loads(s)
     except Exception:
@@ -175,7 +224,6 @@ def extract_json_object(text):
                 except Exception:
                     pass
 
-    import re
     m = re.search(r"\{[\s\S]*\}", s)
     if m:
         try:

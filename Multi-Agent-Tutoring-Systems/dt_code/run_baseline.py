@@ -80,7 +80,7 @@ def stratified_sample(rows, n, seed=42):
     return sample[:n]
 
 
-def run_student(row, provider, model, sleep_s, temperature=0.7, max_tokens=1536):
+def run_student(row, provider, model, sleep_s, temperature=0.7, max_tokens=3072):
     givens = row["Givens"]
     intermediates = row["Intermediates"]["Expressions"]
     conclusion = row["Conclusion"]
@@ -92,7 +92,7 @@ def run_student(row, provider, model, sleep_s, temperature=0.7, max_tokens=1536)
     return parsed, raw
 
 
-def run_tutor(row, student_parsed, provider, model, sleep_s, temperature=0.2, max_tokens=1536):
+def run_tutor(row, student_parsed, provider, model, sleep_s, temperature=0.2, max_tokens=3072):
     givens = row["Givens"]
     intermediates = row["Intermediates"]["Expressions"]
     conclusion = row["Conclusion"]
