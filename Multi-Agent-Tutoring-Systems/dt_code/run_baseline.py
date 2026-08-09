@@ -22,11 +22,19 @@ all free and CPU-only:
      (over-rejection)?
 
 Usage:
-    export GROQ_API_KEY=your_free_key_here
-    python run_baseline.py --n 100
+    # Put one or more Groq keys in ../.env, then:
+    python run_baseline.py --n 516 --seed 42
+
+Multiple keys (recommended for the full 516-run):
+    GROQ_API_KEY=key1
+    GROQ_API_KEYS=key2,key3
+    # or GROQ_API_KEY_2=... / GROQ_API_KEY_3=...
+
+The client rotates keys on rate/daily limits so you do not need long sleeps.
+Resume support: re-run the same command and already-finished ids are skipped.
 
 Only two dependencies beyond the standard library: `requests` and `pyyaml`
-(both free/open source, `pip install requests pyyaml`).
+(both free/open source, `pip install requests pyyaml python-dotenv`).
 """
 
 import argparse
@@ -38,13 +46,15 @@ from pathlib import Path
 
 import KG_local
 import prompts
-from llm_client import call_llm, extract_json_object, LLMError, DailyQuotaExceeded
+from llm_client import call_llm, extract_json_object, LLMError, DailyQuotaExceeded, get_key_pool
+from utils.env_loader import load_env
 
 DATA_DIR = Path(__file__).parent / "Data"
 PRESTATE_PATH = DATA_DIR / "cleaned_data" / "preState.jsonl"
 PROPS_DIR = DATA_DIR / "props"
 OUTPUT_DIR = DATA_DIR / "llm_output"
 OUTPUT_PATH = OUTPUT_DIR / "baseline_run.jsonl"
+DEFAULT_N = 516
 
 
 def load_prestate_rows():
@@ -182,8 +192,12 @@ DEBUG_PATH = None  # set in main()
 
 
 def main():
+    load_env()
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=100, help="number of proof states to sample")
+    ap.add_argument("--n", type=int, default=DEFAULT_N,
+                     help=f"number of proof states to sample (default {DEFAULT_N} = full dataset). "
+                          f"Use 0 to mean 'all rows'.")
     ap.add_argument("--provider", type=str, default="groq", choices=["groq", "gemini"],
                      help="fallback default if --student-provider/--tutor-provider aren't set")
     ap.add_argument("--student-provider", type=str, default="groq", choices=["groq", "gemini"])
@@ -200,7 +214,10 @@ def main():
                      help="higher temperature = more variety/mistakes from the student, "
                           "which is what you actually want to test over-validation")
     ap.add_argument("--tutor-temperature", type=float, default=0.2)
-    ap.add_argument("--sleep", type=float, default=2.0, help="seconds to sleep between calls (free-tier rate limits)")
+    ap.add_argument("--sleep", type=float, default=0.0,
+                     help="seconds to sleep between calls. Default 0 -- with multiple "
+                          "GROQ_API_KEYS the client rotates on 429 instead of waiting. "
+                          "Set >0 only if you have a single key and still hit RPM limits.")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -210,10 +227,15 @@ def main():
 
     rows = load_prestate_rows()
     print(f"Loaded {len(rows)} proof states total.")
-    sample = stratified_sample(rows, args.n, seed=args.seed)
-    print(f"Sampled {len(sample)} states across {len(set(r['currentProblem'] for r in sample))} problems.")
+    n = len(rows) if args.n <= 0 else min(args.n, len(rows))
+    sample = stratified_sample(rows, n, seed=args.seed)
+    print(f"Sampled {len(sample)} states across {len(set(r['currentProblem'] for r in sample))} problems "
+          f"(seed={args.seed}).")
     print(f"Student model: {args.student_provider}/{args.student_model} (temp={args.student_temperature})")
     print(f"Tutor model:   {args.tutor_provider}/{args.tutor_model} (temp={args.tutor_temperature})")
+    print(f"API key pools: {get_key_pool(args.student_provider).summary()}; "
+          f"{get_key_pool(args.tutor_provider).summary()}")
+    print(f"Inter-call sleep: {args.sleep}s")
 
     # --- Resume support: skip anything already completed in a prior run ---
     already_done_ids = set()
@@ -286,13 +308,11 @@ def main():
                       f"ground_truth={gt_label} tutor_verdict={tutor_verdict}")
 
             except DailyQuotaExceeded as e:
-                # Retrying can't fix this -- stop the whole run cleanly instead
-                # of continuing to burn failed attempts against an exhausted model.
-                print(f"\n! Daily quota exhausted, stopping run early: {e}")
-                print("  Your progress is saved. Re-run the exact same command later "
-                      "(after the quota resets, usually within a few hours) or switch "
-                      "--student-model/--tutor-model/--student-provider/--tutor-provider "
-                      "to a model with quota left, and it will pick up where it left off.")
+                # All configured keys for this model are exhausted.
+                print(f"\n! Daily quota exhausted on every configured key: {e}")
+                print("  Progress is saved. Add more keys to GROQ_API_KEYS (or GOOGLE_API_KEYS), "
+                      "then re-run the exact same command -- finished ids are skipped. "
+                      "Or wait for quota reset.")
                 stopped_early_reason = str(e)
                 break
             except LLMError as e:

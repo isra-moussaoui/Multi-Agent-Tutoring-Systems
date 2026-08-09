@@ -44,15 +44,17 @@ though you'll still see them in older examples/blog posts. Check
 https://console.groq.com/docs/deprecations if any model here errors out.
 
 Usage:
-    export GROQ_API_KEY=your_free_key_here
-    python run_pipeline.py --n 100
+    python run_pipeline.py --n 516 --seed 42
 
-(GOOGLE_API_KEY only needed if you explicitly pass --tutor-provider gemini
- / --recovery-provider gemini.)
+Multiple keys in ../.env (recommended for the full run):
+    GROQ_API_KEY=key1
+    GROQ_API_KEYS=key2,key3
 
-Resume support, quota-exhaustion handling, and output format all mirror
-run_baseline.py so the two scripts (and their output files) are directly
-comparable for the paper's baseline-vs-pipeline metrics table.
+The client rotates keys on rate/daily limits so you do not need long sleeps.
+Same seed + same default models as run_baseline.py for a fair comparison.
+Resume support mirrors run_baseline.py.
+
+(GOOGLE_API_KEY / GOOGLE_API_KEYS only needed if you pass --*-provider gemini.)
 """
 
 import argparse
@@ -63,18 +65,20 @@ from pathlib import Path
 
 import KG_local
 import prompts
-from llm_client import call_llm, extract_json_object, LLMError, DailyQuotaExceeded
+from llm_client import call_llm, extract_json_object, LLMError, DailyQuotaExceeded, get_key_pool
 from run_baseline import (
     load_prestate_rows,
     stratified_sample,
     run_student,
     ground_truth_label,
 )
+from utils.env_loader import load_env
 
 DATA_DIR = Path(__file__).parent / "Data"
 PROPS_DIR = DATA_DIR / "props"
 OUTPUT_DIR = DATA_DIR / "llm_output"
 OUTPUT_PATH = OUTPUT_DIR / "pipeline_run.jsonl"
+DEFAULT_N = 516
 
 VERDICT_TO_LABEL = {
     "correct": "optimal",
@@ -211,8 +215,12 @@ DEBUG_PATH = None
 
 
 def main():
+    load_env()
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=100, help="number of proof states to sample")
+    ap.add_argument("--n", type=int, default=DEFAULT_N,
+                     help=f"number of proof states to sample (default {DEFAULT_N} = full dataset). "
+                          f"Use 0 to mean 'all rows'.")
 
     ap.add_argument("--student-provider", type=str, default="groq", choices=["groq", "gemini"])
     ap.add_argument("--student-model", type=str, default=DEFAULT_STUDENT_MODEL)
@@ -233,7 +241,9 @@ def main():
     ap.add_argument("--recovery-model", type=str, default=DEFAULT_RECOVERY_MODEL)
     ap.add_argument("--recovery-temperature", type=float, default=0.2)
 
-    ap.add_argument("--sleep", type=float, default=2.0, help="seconds to sleep between calls (free-tier rate limits)")
+    ap.add_argument("--sleep", type=float, default=0.0,
+                     help="seconds to sleep between calls. Default 0 -- with multiple "
+                          "GROQ_API_KEYS the client rotates on 429 instead of waiting.")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -243,12 +253,17 @@ def main():
 
     rows = load_prestate_rows()
     print(f"Loaded {len(rows)} proof states total.")
-    sample = stratified_sample(rows, args.n, seed=args.seed)
-    print(f"Sampled {len(sample)} states across {len(set(r['currentProblem'] for r in sample))} problems.")
+    n = len(rows) if args.n <= 0 else min(args.n, len(rows))
+    sample = stratified_sample(rows, n, seed=args.seed)
+    print(f"Sampled {len(sample)} states across {len(set(r['currentProblem'] for r in sample))} problems "
+          f"(seed={args.seed}).")
     print(f"Student model:   {args.student_provider}/{args.student_model} (temp={args.student_temperature})")
     print(f"Tutor model:     {args.tutor_provider}/{args.tutor_model} (temp={args.tutor_temperature})")
     print(f"Verifier model:  {args.verifier_provider}/{args.verifier_model} (temp={args.verifier_temperature})")
     print(f"Recovery model:  {args.recovery_provider}/{args.recovery_model} (temp={args.recovery_temperature})")
+    providers = {args.student_provider, args.tutor_provider, args.verifier_provider, args.recovery_provider}
+    print("API key pools: " + "; ".join(get_key_pool(p).summary() for p in sorted(providers)))
+    print(f"Inter-call sleep: {args.sleep}s")
 
     # --- Resume support: skip anything already completed in a prior run ---
     already_done_ids = set()
@@ -368,10 +383,10 @@ def main():
                       f"{'AGREE' if agree else 'DISAGREE->recovery'} final={final_verdict}")
 
             except DailyQuotaExceeded as e:
-                print(f"\n! Daily quota exhausted, stopping run early: {e}")
-                print("  Your progress is saved. Re-run the exact same command later "
-                      "(after the quota resets) or switch models/providers with quota "
-                      "left, and it will pick up where it left off.")
+                print(f"\n! Daily quota exhausted on every configured key: {e}")
+                print("  Progress is saved. Add more keys to GROQ_API_KEYS (or GOOGLE_API_KEYS), "
+                      "then re-run the exact same command -- finished ids are skipped. "
+                      "Or wait for quota reset.")
                 stopped_early_reason = str(e)
                 break
             except LLMError as e:
@@ -403,7 +418,7 @@ def main():
         print(f"  {k}: {v}")
 
     print("\nTo compare against the single-agent baseline, also run:")
-    print("    python run_baseline.py --n", args.n)
+    print("    python run_baseline.py --n", n, "--seed", args.seed)
     print("and compare its over_validation_rate / over_rejection_rate against this "
           "pipeline's -- that comparison is the core result for the paper.")
 
