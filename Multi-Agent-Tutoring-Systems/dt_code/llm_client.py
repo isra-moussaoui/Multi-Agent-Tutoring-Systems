@@ -1,23 +1,18 @@
 """
 llm_client.py
 
-Thin, dependency-light wrapper around two FREE hosted LLM APIs:
-  - Groq   (https://console.groq.com) -- fast, generous free tier, hosts
-            open models like Llama-3.3-70B and Qwen. Use as your GROQ_MODEL.
-  - Gemini (https://aistudio.google.com) -- free tier for Gemini Flash models.
+Thin, dependency-light wrapper around hosted LLM APIs:
+  - Mistral (https://console.mistral.ai) -- default provider
+  - Groq    (https://console.groq.com) -- free-tier open models
+  - Gemini  (https://aistudio.google.com) -- free tier for Gemini Flash models
 
-Only `requests` is needed (no heavy SDKs). Both are plain REST calls, so your
-laptop's CPU does nothing but send/receive JSON -- all the actual inference
-runs on Groq's / Google's servers for free.
+Only `requests` is needed (no heavy SDKs). Plain REST calls; inference runs
+on the provider's servers.
 
-Set API keys as environment variables (e.g. in a .env file, loaded by
-python-dotenv in run_baseline.py):
-    GROQ_API_KEY=...
-    GOOGLE_API_KEY=...      # optional, only needed if you use provider="gemini"
-
-Recommended default split for genuine independence between Tutor and Verifier
-in later steps: use a DIFFERENT model family for each (e.g. Groq/Llama for the
-student simulator + Tutor, Gemini for the Verifier once you build Step 4).
+Set API keys as environment variables (e.g. in a .env file):
+    MISTRAL_API_KEY=...     # default provider
+    GROQ_API_KEY=...        # optional, if you use provider="groq"
+    GOOGLE_API_KEY=...      # optional, if you use provider="gemini"
 """
 
 import os
@@ -26,9 +21,11 @@ import time
 import json
 import requests
 
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
+DEFAULT_MISTRAL_MODEL = "mistral-large-latest"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"  # llama-3.1-8b-instant and
                                             # llama-3.3-70b-versatile are BOTH
                                             # being shut down by Groq on
@@ -61,6 +58,47 @@ def _is_daily_quota_error(resp_text):
     t = resp_text.lower()
     return ("tokens per day" in t or "requests per day" in t
             or " tpd" in t or " rpd" in t or "daily" in t)
+
+
+def _call_mistral(prompt, model=DEFAULT_MISTRAL_MODEL, temperature=0.2, max_tokens=2048, retries=3):
+    """OpenAI-compatible chat completions against api.mistral.ai."""
+    api_key = os.environ.get("MISTRAL_API_KEY")
+    if not api_key:
+        raise LLMError("MISTRAL_API_KEY is not set. Get a key at https://console.mistral.ai")
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    last_err = None
+    for attempt in range(retries):
+        resp = requests.post(MISTRAL_URL, headers=headers, json=body, timeout=90)
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            if not content:
+                finish_reason = data["choices"][0].get("finish_reason")
+                raise LLMError(
+                    f"Mistral returned empty content (finish_reason={finish_reason})"
+                )
+            return content
+        if resp.status_code == 429:
+            if _is_daily_quota_error(resp.text):
+                raise DailyQuotaExceeded(
+                    f"Mistral quota exhausted for model '{model}': {resp.text}"
+                )
+            wait = 5 * (attempt + 1)
+            print(f"  [mistral] rate limited, waiting {wait}s...")
+            time.sleep(wait)
+            last_err = resp.text
+            continue
+        raise LLMError(f"Mistral API error {resp.status_code}: {resp.text}")
+
+    raise LLMError(f"Mistral API failed after {retries} retries: {last_err}")
 
 
 def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=2048, retries=3):
@@ -167,16 +205,18 @@ def _call_gemini(prompt, model=DEFAULT_GEMINI_MODEL, temperature=0.2, max_tokens
     raise LLMError(f"Gemini API failed after {retries} retries: {last_err}")
 
 
-def call_llm(prompt, provider="groq", model=None, temperature=0.2, max_tokens=1536):
-    """Unified entry point. provider in {'groq', 'gemini'}."""
+def call_llm(prompt, provider="mistral", model=None, temperature=0.2, max_tokens=1536):
+    """Unified entry point. provider in {'mistral', 'groq', 'gemini'}."""
+    if provider == "mistral":
+        return _call_mistral(prompt, model=model or DEFAULT_MISTRAL_MODEL,
+                              temperature=temperature, max_tokens=max_tokens)
     if provider == "groq":
         return _call_groq(prompt, model=model or DEFAULT_GROQ_MODEL,
                            temperature=temperature, max_tokens=max_tokens)
-    elif provider == "gemini":
+    if provider == "gemini":
         return _call_gemini(prompt, model=model or DEFAULT_GEMINI_MODEL,
                              temperature=temperature, max_tokens=max_tokens)
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+    raise ValueError(f"Unknown provider: {provider}")
 
 
 def extract_json_object(text):
@@ -235,11 +275,11 @@ def extract_json_object(text):
 
 
 if __name__ == "__main__":
-    # Quick manual smoke test -- only runs real network calls if GROQ_API_KEY is set.
-    if os.environ.get("GROQ_API_KEY"):
+    # Quick manual smoke test -- only runs real network calls if MISTRAL_API_KEY is set.
+    if os.environ.get("MISTRAL_API_KEY"):
         out = call_llm("Reply with exactly this JSON: {\"ok\": true}")
-        print("Groq response:", out)
+        print("Mistral response:", out)
         print("Parsed:", extract_json_object(out))
     else:
-        print("GROQ_API_KEY not set -- skipping live call. "
-              "Get a free key at https://console.groq.com and set it to test.")
+        print("MISTRAL_API_KEY not set -- skipping live call. "
+              "Get a key at https://console.mistral.ai and set it to test.")

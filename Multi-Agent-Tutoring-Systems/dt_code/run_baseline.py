@@ -39,6 +39,9 @@ from pathlib import Path
 import KG_local
 import prompts
 from llm_client import call_llm, extract_json_object, LLMError, DailyQuotaExceeded
+from utils.env_loader import load_env
+
+load_env()
 
 DATA_DIR = Path(__file__).parent / "Data"
 PRESTATE_PATH = DATA_DIR / "cleaned_data" / "preState.jsonl"
@@ -163,38 +166,24 @@ def compute_metrics(traces):
     }
 
 
-DEFAULT_STUDENT_MODEL = "openai/gpt-oss-20b"    # Groq -- weaker/smaller model,
-                                                  # makes realistic mistakes.
-                                                  # (replaces llama-3.1-8b-instant,
-                                                  # shut down by Groq 08/16/26)
-DEFAULT_TUTOR_MODEL = "qwen/qwen3.6-27b"          # Groq -- different model
-                                                  # FAMILY from the Student
-                                                  # (OpenAI vs Qwen architecture),
-                                                  # and a separate per-model
-                                                  # daily quota bucket on Groq's
-                                                  # free tier, so Student and
-                                                  # Tutor calls don't compete
-                                                  # for the same cap.
-                                                  # (replaces llama-3.3-70b-versatile,
-                                                  # shut down by Groq 08/16/26)
+DEFAULT_PROVIDER = "mistral"
+DEFAULT_STUDENT_MODEL = "mistral-large-latest"
+DEFAULT_TUTOR_MODEL = "mistral-large-latest"
 
 DEBUG_PATH = None  # set in main()
+
+_PROVIDER_CHOICES = ["mistral", "groq", "gemini"]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=100, help="number of proof states to sample")
-    ap.add_argument("--provider", type=str, default="groq", choices=["groq", "gemini"],
+    ap.add_argument("--provider", type=str, default=DEFAULT_PROVIDER, choices=_PROVIDER_CHOICES,
                      help="fallback default if --student-provider/--tutor-provider aren't set")
-    ap.add_argument("--student-provider", type=str, default="groq", choices=["groq", "gemini"])
-    ap.add_argument("--tutor-provider", type=str, default="groq", choices=["groq", "gemini"],
-                     help="defaults to groq (same provider as student, but a "
-                          "DIFFERENT model+family, so the two roles use "
-                          "separate per-model daily quota buckets on Groq's "
-                          "free tier rather than sharing one)")
+    ap.add_argument("--student-provider", type=str, default=DEFAULT_PROVIDER, choices=_PROVIDER_CHOICES)
+    ap.add_argument("--tutor-provider", type=str, default=DEFAULT_PROVIDER, choices=_PROVIDER_CHOICES)
     ap.add_argument("--student-model", type=str, default=DEFAULT_STUDENT_MODEL,
-                     help="deliberately weaker than the tutor model, so it makes real mistakes "
-                          "instead of near-always solving correctly")
+                     help="student simulator model id for the chosen provider")
     ap.add_argument("--tutor-model", type=str, default=DEFAULT_TUTOR_MODEL)
     ap.add_argument("--student-temperature", type=float, default=0.7,
                      help="higher temperature = more variety/mistakes from the student, "

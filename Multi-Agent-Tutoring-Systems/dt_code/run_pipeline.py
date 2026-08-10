@@ -1,6 +1,10 @@
 """
 run_pipeline.py
 
+REFERENCE / sequential implementation of the multi-agent pipeline.
+Prefer `run_graph_pipeline.py` for the LangGraph tutoring core
+(Tutor -> Verifier -> Compare -> Recovery -> Finalize in dt_code/graph/).
+
 The full multi-agent pipeline described in the README (Tutor -> Verifier ->
 Compare -> Recovery), built on top of the same free-API approach as
 run_baseline.py. No local model inference anywhere -- Student, Tutor,
@@ -64,12 +68,15 @@ from pathlib import Path
 import KG_local
 import prompts
 from llm_client import call_llm, extract_json_object, LLMError, DailyQuotaExceeded
+from utils.env_loader import load_env
 from run_baseline import (
     load_prestate_rows,
     stratified_sample,
     run_student,
     ground_truth_label,
 )
+
+load_env()
 
 DATA_DIR = Path(__file__).parent / "Data"
 PROPS_DIR = DATA_DIR / "props"
@@ -199,37 +206,34 @@ def compute_metrics(traces):
     }
 
 
-DEFAULT_STUDENT_MODEL = "openai/gpt-oss-20b"   # llama-3.1-8b-instant shut down by Groq 08/16/26
-DEFAULT_TUTOR_MODEL = "qwen/qwen3.6-27b"        # different family from Student -- own quota bucket
-DEFAULT_VERIFIER_MODEL = "openai/gpt-oss-120b"  # different SIZE from both Student and Tutor,
-                                                  # own quota bucket -- genuine independence from
-                                                  # the Tutor (llama-3.3-70b-versatile shut down 08/16/26)
-DEFAULT_RECOVERY_MODEL = "openai/gpt-oss-120b"  # reuses Verifier's model -- fine, Recovery only
-                                                  # fires on disagreements so call volume is low
+DEFAULT_PROVIDER = "mistral"
+DEFAULT_STUDENT_MODEL = "mistral-large-latest"
+DEFAULT_TUTOR_MODEL = "mistral-large-latest"
+DEFAULT_VERIFIER_MODEL = "mistral-large-latest"
+DEFAULT_RECOVERY_MODEL = "mistral-large-latest"
 
 DEBUG_PATH = None
+
+_PROVIDER_CHOICES = ["mistral", "groq", "gemini"]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=100, help="number of proof states to sample")
 
-    ap.add_argument("--student-provider", type=str, default="groq", choices=["groq", "gemini"])
+    ap.add_argument("--student-provider", type=str, default=DEFAULT_PROVIDER, choices=_PROVIDER_CHOICES)
     ap.add_argument("--student-model", type=str, default=DEFAULT_STUDENT_MODEL)
     ap.add_argument("--student-temperature", type=float, default=0.7)
 
-    ap.add_argument("--tutor-provider", type=str, default="groq", choices=["groq", "gemini"])
+    ap.add_argument("--tutor-provider", type=str, default=DEFAULT_PROVIDER, choices=_PROVIDER_CHOICES)
     ap.add_argument("--tutor-model", type=str, default=DEFAULT_TUTOR_MODEL)
     ap.add_argument("--tutor-temperature", type=float, default=0.2)
 
-    ap.add_argument("--verifier-provider", type=str, default="groq", choices=["groq", "gemini"],
-                     help="defaults to a DIFFERENT provider+model than the Tutor, for genuine "
-                          "independence and to avoid sharing a daily quota with the Tutor")
+    ap.add_argument("--verifier-provider", type=str, default=DEFAULT_PROVIDER, choices=_PROVIDER_CHOICES)
     ap.add_argument("--verifier-model", type=str, default=DEFAULT_VERIFIER_MODEL)
     ap.add_argument("--verifier-temperature", type=float, default=0.2)
 
-    ap.add_argument("--recovery-provider", type=str, default="groq", choices=["groq", "gemini"],
-                     help="only called on disagreements, so it's a small fraction of total calls")
+    ap.add_argument("--recovery-provider", type=str, default=DEFAULT_PROVIDER, choices=_PROVIDER_CHOICES)
     ap.add_argument("--recovery-model", type=str, default=DEFAULT_RECOVERY_MODEL)
     ap.add_argument("--recovery-temperature", type=float, default=0.2)
 

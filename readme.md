@@ -8,7 +8,9 @@ Single-agent LLM tutors have a well-documented weakness: they tend to validate w
 
 **But does that actually work?**
 
-This project tests that question. We build a small multi-agent tutoring pipeline (Tutor → Verifier → Recovery controller) in LangGraph and measure whether the Verifier genuinely catches the Tutor's errors, or just agrees with it — a phenomenon known as conformity bias. We benchmark both a single-agent baseline and our multi-agent pipeline on a real, publicly available propositional-logic tutoring dataset and compare the failure rates.
+This project tests that question. We build a small multi-agent tutoring pipeline (Tutor → Verifier → Recovery controller) in **LangGraph** and measure whether the Verifier genuinely catches the Tutor's errors, or just agrees with it — a phenomenon known as conformity bias. We benchmark both a single-agent baseline and our multi-agent pipeline on a real, publicly available propositional-logic tutoring dataset and compare the failure rates.
+
+**Implementation note:** The tutoring core (`Tutor → Verifier → Compare → Recovery → Finalize`) is a compiled LangGraph in `dt_code/graph/`. Student simulation and KG-grounded labels run outside the graph as the evaluation harness (`run_graph_pipeline.py`). The Verifier node is hard-constrained never to read the Tutor’s verdict when building its prompt (anti-conformity invariant). LLM calls go through `llm_client.py` (Mistral / Groq / Gemini).
 
 ## The Research Gap We Are Filling
 
@@ -144,10 +146,22 @@ Our pipeline uses the KG-grounded ground truth only for evaluation (comparing ou
 
 ## Target Output
 
-* Runnable LangGraph pipeline with Tutor + Verifier + Recovery
-* Evaluation results table comparing baseline vs. multi-agent
+* Runnable LangGraph pipeline with Tutor + Verifier + Recovery — see `dt_code/graph/` and `python run_graph_pipeline.py`
+* Evaluation results table comparing baseline vs. multi-agent (`run_baseline.py` vs `run_graph_pipeline.py`)
 * Short research paper (4–6 pages, workshop format)
 * arXiv preprint
+
+## Running the LangGraph pipeline
+
+From `Multi-Agent-Tutoring-Systems/dt_code/` (with `MISTRAL_API_KEY` or another provider key in `../.env`):
+
+```bash
+pip install -r ../../requirements.txt
+python run_graph_pipeline.py --n 10
+python run_baseline.py --n 10
+```
+
+Optional: `--checkpoint` enables an in-memory LangGraph checkpointer keyed by case id. The older sequential script `run_pipeline.py` remains as a reference implementation of the same control flow.
 
 ## References
 
