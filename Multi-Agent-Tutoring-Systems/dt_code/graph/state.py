@@ -1,4 +1,18 @@
-"""LangGraph state for the tutoring core (Tutor → Verifier → Compare → Recovery)."""
+"""LangGraph state for the tutoring core.
+
+Architecture:
+
+    Tutor || Verifier
+          ↓
+        Compare
+          ↓
+    Recovery? 
+          ↓
+       Finalize
+
+Ground truth is kept in eval_only and must never be used by
+any agent prompt builder.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +33,7 @@ class AgentResult(TypedDict, total=False):
     raw: Optional[str]
     latency_ms: float
     model: str
+    provider: str
     parse_ok: bool
 
 
@@ -28,42 +43,72 @@ class RecoveryResult(TypedDict, total=False):
     raw: Optional[str]
     latency_ms: float
     model: str
+    provider: str
     parse_ok: bool
 
 
 class CompareResult(TypedDict, total=False):
     agreed: bool
+    tutor_verdict: Optional[str]
+    verifier_verdict: Optional[str]
+    tutor_parse_ok: bool
+    verifier_parse_ok: bool
 
 
-Status = Literal["ok", "parse_error", "quota", "failed"]
+Status = Literal[
+    "ok",
+    "parse_error",
+    "quota",
+    "failed",
+]
 
 
 class TutoringState(TypedDict, total=False):
-    """Full graph state. Ground truth must never be read by agent prompt builders.
 
-    Optional `eval_only` may hold harness-side fields (e.g. ground_truth_label);
-    no node may read it for prompting.
-    """
+    # =========================================================
+    # INPUT
+    # =========================================================
 
-    # --- Input (harness) ---
     case_id: str
+
     givens: Any
     intermediates: Any
     conclusion: Any
+
     student_step: StudentStep
 
-    # --- Agent outputs ---
+    # =========================================================
+    # AGENT OUTPUTS
+    # =========================================================
+
     tutor: AgentResult
+
     verifier: AgentResult
+
     compare: CompareResult
+
     recovery: RecoveryResult
 
-    # --- Final ---
-    final_verdict: Optional[str]
-    final_feedback: Optional[str]
-    recovery_flag: bool
-    status: Status
-    errors: Annotated[list[str], operator.add]
+    # =========================================================
+    # FINAL
+    # =========================================================
 
-    # --- Eval only (never used in prompts) ---
+    final_verdict: Optional[str]
+
+    final_feedback: Optional[str]
+
+    recovery_flag: bool
+
+    status: Status
+
+    errors: Annotated[
+        list[str],
+        operator.add,
+    ]
+
+    # =========================================================
+    # EVALUATION ONLY
+    # =========================================================
+
+    # NEVER read this from prompt-building code.
     eval_only: dict[str, Any]

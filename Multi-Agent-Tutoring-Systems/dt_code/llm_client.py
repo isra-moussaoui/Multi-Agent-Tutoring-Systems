@@ -35,6 +35,7 @@ GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{mode
 
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_MISTRAL_MODEL = "mistral-large-latest"
 
 
 class LLMError(Exception):
@@ -92,7 +93,10 @@ def load_provider_keys(provider):
         return _collect_keys("GROQ_API_KEY", "GROQ_API_KEYS")
     if provider == "gemini":
         return _collect_keys("GOOGLE_API_KEY", "GOOGLE_API_KEYS")
+    if provider == "mistral":
+        return _collect_keys("MISTRAL_API_KEY", "MISTRAL_API_KEYS")
     raise ValueError(f"Unknown provider: {provider}")
+
 
 
 class ApiKeyPool:
@@ -168,45 +172,272 @@ def _is_daily_quota_error(resp_text):
             or "quota exceeded" in t or "exceeded your current quota" in t)
 
 
-def _call_mistral(prompt, model=DEFAULT_MISTRAL_MODEL, temperature=0.2, max_tokens=2048, retries=3):
-    """OpenAI-compatible chat completions against api.mistral.ai."""
-    api_key = os.environ.get("MISTRAL_API_KEY")
-    if not api_key:
-        raise LLMError("MISTRAL_API_KEY is not set. Get a key at https://console.mistral.ai")
+def _call_mistral(
+    prompt,
+    model=DEFAULT_MISTRAL_MODEL,
+    temperature=0.2,
+    max_tokens=2048,
+    retries=3,
+):
+    """Call Mistral using the thread-safe multi-key pool.
 
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    Behavior:
+
+    - Round-robin across configured keys.
+    - Rotate immediately on short-lived 429.
+    - Mark a key exhausted for the requested model on daily quota.
+    - Continue with remaining keys.
+    - Raise DailyQuotaExceeded only when all keys are exhausted.
+    """
+
+    pool = get_key_pool(
+        "mistral"
+    )
+
+    if not pool.keys:
+
+        raise LLMError(
+            "No Mistral API keys found. "
+            "Set MISTRAL_API_KEY and/or "
+            "MISTRAL_API_KEYS "
+            "(comma-separated) in .env."
+        )
+
     body = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+
+        "model":
+            model,
+
+        "messages": [
+            {
+                "role":
+                    "user",
+
+                "content":
+                    prompt,
+            }
+        ],
+
+        "temperature":
+            temperature,
+
+        "max_tokens":
+            max_tokens,
     }
 
-    last_err = None
-    for attempt in range(retries):
-        resp = requests.post(MISTRAL_URL, headers=headers, json=body, timeout=90)
-        if resp.status_code == 200:
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            if not content:
-                finish_reason = data["choices"][0].get("finish_reason")
-                raise LLMError(
-                    f"Mistral returned empty content (finish_reason={finish_reason})"
-                )
-            return content
-        if resp.status_code == 429:
-            if _is_daily_quota_error(resp.text):
-                raise DailyQuotaExceeded(
-                    f"Mistral quota exhausted for model '{model}': {resp.text}"
-                )
-            wait = 5 * (attempt + 1)
-            print(f"  [mistral] rate limited, waiting {wait}s...")
-            time.sleep(wait)
-            last_err = resp.text
-            continue
-        raise LLMError(f"Mistral API error {resp.status_code}: {resp.text}")
+    # One attempt per key, plus additional
+    # complete rotations.
 
-    raise LLMError(f"Mistral API failed after {retries} retries: {last_err}")
+    max_attempts = max(
+        retries * max(1, len(pool.keys)),
+        len(pool.keys),
+    )
+
+    last_err = None
+
+    keys_tried_this_cycle = set()
+
+    for attempt in range(
+        max_attempts
+    ):
+
+        reason = (
+            "rate limited"
+            if keys_tried_this_cycle
+            else None
+        )
+
+        api_key = pool.acquire(
+            model,
+            reason=reason,
+        )
+
+        if not api_key:
+
+            raise DailyQuotaExceeded(
+
+                "All Mistral API keys exhausted "
+                f"daily quota for model '{model}'. "
+                "Add more keys to MISTRAL_API_KEYS "
+                "or wait for quota reset."
+            )
+
+        headers = {
+
+            "Authorization":
+                f"Bearer {api_key}",
+
+            "Content-Type":
+                "application/json",
+        }
+
+        try:
+
+            resp = requests.post(
+
+                MISTRAL_URL,
+
+                headers=headers,
+
+                json=body,
+
+                timeout=90,
+            )
+
+        except requests.RequestException as exc:
+
+            last_err = str(exc)
+
+            # Network errors should allow another
+            # configured key to be attempted.
+
+            keys_tried_this_cycle.add(
+                api_key
+            )
+
+            continue
+
+        # ====================================================
+        # SUCCESS
+        # ====================================================
+
+        if resp.status_code == 200:
+
+            try:
+
+                data = resp.json()
+
+                content = (
+                    data["choices"][0]
+                    ["message"]["content"]
+                )
+
+            except (
+                KeyError,
+                IndexError,
+                TypeError,
+                ValueError,
+            ) as exc:
+
+                raise LLMError(
+                    "Mistral returned an unexpected "
+                    f"response format: {exc}"
+                )
+
+            if not content:
+
+                finish_reason = (
+                    data["choices"][0]
+                    .get(
+                        "finish_reason"
+                    )
+                )
+
+                raise LLMError(
+                    "Mistral returned empty content "
+                    f"(finish_reason={finish_reason})"
+                )
+
+            return content
+
+        # ====================================================
+        # RATE LIMIT / QUOTA
+        # ====================================================
+
+        if resp.status_code == 429:
+
+            last_err = resp.text
+
+            # ------------------------------------------------
+            # Daily quota
+            # ------------------------------------------------
+
+            if _is_daily_quota_error(
+                resp.text
+            ):
+
+                left = (
+                    pool.mark_daily_exhausted(
+                        api_key,
+                        model,
+                    )
+                )
+
+                if left == 0:
+
+                    raise DailyQuotaExceeded(
+
+                        "All Mistral API keys exhausted "
+                        f"daily quota for model '{model}': "
+                        f"{resp.text}"
+                    )
+
+                # Try next key immediately.
+
+                keys_tried_this_cycle.clear()
+
+                continue
+
+            # ------------------------------------------------
+            # Short-lived rate limit
+            # ------------------------------------------------
+
+            keys_tried_this_cycle.add(
+                api_key
+            )
+
+            usable = pool.available(
+                model
+            )
+
+            if (
+                len(keys_tried_this_cycle)
+                >= len(usable)
+                and len(usable) > 0
+            ):
+
+                wait = min(
+                    3,
+                    1
+                    + attempt
+                    // max(
+                        1,
+                        len(usable),
+                    ),
+                )
+
+                print(
+                    f"  [mistral] all "
+                    f"{len(usable)} key(s) "
+                    f"rate-limited once; "
+                    f"brief wait {wait}s..."
+                )
+
+                time.sleep(
+                    wait
+                )
+
+                keys_tried_this_cycle.clear()
+
+            continue
+
+        # ====================================================
+        # OTHER API ERROR
+        # ====================================================
+
+        raise LLMError(
+
+            "Mistral API error "
+            f"{resp.status_code}: "
+            f"{resp.text}"
+        )
+
+    raise LLMError(
+
+        "Mistral API failed after "
+        f"{max_attempts} attempts: "
+        f"{last_err}"
+    )
 
 
 def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=2048, retries=3):
@@ -400,15 +631,89 @@ def extract_json_object(text):
 
     return None
 
-
 if __name__ == "__main__":
+
     from utils.env_loader import load_env
+
     load_env()
-    pool = get_key_pool("groq")
-    print(pool.summary())
-    if pool.keys:
-        out = call_llm("Reply with exactly this JSON: {\"ok\": true}")
-        print("Mistral response:", out)
-        print("Parsed:", extract_json_object(out))
-    else:
-        print("No GROQ keys set -- skipping live call.")
+
+    print(
+        "=== API KEY POOLS ==="
+    )
+
+    for provider in (
+        "mistral",
+        "groq",
+        "gemini",
+    ):
+
+        try:
+
+            pool = get_key_pool(
+                provider
+            )
+
+            print(
+                f"{provider}: "
+                f"{pool.summary()}"
+            )
+
+        except Exception as exc:
+
+            print(
+                f"{provider}: "
+                f"ERROR - {exc}"
+            )
+
+    # --------------------------------------------------------
+    # Optional live Mistral test
+    # --------------------------------------------------------
+
+    try:
+
+        pool = get_key_pool(
+            "mistral"
+        )
+
+        if pool.keys:
+
+            out = call_llm(
+
+                'Reply with exactly this JSON: {"ok": true}',
+
+                provider="mistral",
+
+                model=DEFAULT_MISTRAL_MODEL,
+
+                temperature=0.0,
+
+                max_tokens=100,
+            )
+
+            print(
+                "\nMistral response:"
+            )
+
+            print(out)
+
+            print(
+                "\nParsed:"
+            )
+
+            print(
+                extract_json_object(out)
+            )
+
+        else:
+
+            print(
+                "\nNo Mistral keys configured; "
+                "skipping live test."
+            )
+
+    except Exception as exc:
+
+        print(
+            f"\nMistral test failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
