@@ -76,7 +76,6 @@ def role_from_configurable(
                 defaults.max_tokens,
             )
         ),
-
         sleep_s=float(
             raw.get(
                 "sleep_s",

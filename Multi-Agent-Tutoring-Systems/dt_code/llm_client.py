@@ -2,33 +2,36 @@
 llm_client.py
 
 Thin, dependency-light wrapper around two FREE hosted LLM APIs:
-  - Groq   (https://console.groq.com) -- fast, generous free tier, hosts
-            open models like Llama-3.3-70B and Qwen. Use as your GROQ_MODEL.
-  - Gemini (https://aistudio.google.com) -- free tier for Gemini Flash models.
+  - Groq   (https://console.groq.com)
+  - Gemini (https://aistudio.google.com)
 
-Only `requests` is needed (no heavy SDKs). Both are plain REST calls, so your
-laptop's CPU does nothing but send/receive JSON -- all the actual inference
-runs on Groq's / Google's servers for free.
+Supports multiple API keys so long runs (e.g. all 516 proof states) can keep
+going without waiting for a single key's rate/daily quota to reset.
 
-Set API keys as environment variables (e.g. in a .env file, loaded by
-python-dotenv in run_baseline.py):
-    GROQ_API_KEY=...
-    GOOGLE_API_KEY=...      # optional, only needed if you use provider="gemini"
+Put keys in `.env` as either:
+    GROQ_API_KEY=key1
+    GROQ_API_KEYS=key2,key3          # comma/whitespace-separated extras
+    GROQ_API_KEY_2=...               # or numbered keys
+    GROQ_API_KEY_3=...
 
-Recommended default split for genuine independence between Tutor and Verifier
-in later steps: use a DIFFERENT model family for each (e.g. Groq/Llama for the
-student simulator + Tutor, Gemini for the Verifier once you build Step 4).
+Same pattern for Gemini: GOOGLE_API_KEY / GOOGLE_API_KEYS / GOOGLE_API_KEY_N.
+
+On a short-lived 429, the client rotates to the next key immediately.
+On a daily quota hit for one key+model, that key is marked exhausted for that
+model and the next key is tried. Only when every key is exhausted does the
+caller see DailyQuotaExceeded.
 """
 
 import os
 import re
 import time
 import json
+import threading
 import requests
 
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -40,308 +43,147 @@ class LLMError(Exception):
 
 
 class DailyQuotaExceeded(LLMError):
-    """Raised when a provider's daily token/request cap is hit -- retrying with
-    backoff cannot fix this (the reset is usually hours away), so callers
-    should stop hammering this model/provider rather than burn retries."""
+    """Raised when every configured key for this provider has hit its daily
+    cap for the requested model. Retrying cannot fix this until quota resets."""
     pass
+
+
+def _mask_key(key):
+    if not key:
+        return "<empty>"
+    if len(key) <= 8:
+        return "***"
+    return f"...{key[-4:]}"
+
+
+def _split_keys(raw):
+    if not raw:
+        return []
+    parts = re.split(r"[\s,;]+", raw.strip())
+    return [p for p in parts if p]
+
+
+def _collect_keys(single_var, multi_var):
+    """
+    Gather unique keys from:
+      - single var like GROQ_API_KEY
+      - multi var like GROQ_API_KEYS (comma/whitespace-separated)
+      - numbered vars like GROQ_API_KEY_1, GROQ_API_KEY_2, ...
+    """
+    keys = []
+    seen = set()
+
+    def add(key):
+        key = (key or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    add(os.environ.get(single_var, ""))
+    for k in _split_keys(os.environ.get(multi_var, "")):
+        add(k)
+    for i in range(1, 64):
+        add(os.environ.get(f"{single_var}_{i}", ""))
+
+    return keys
+
+
+def load_provider_keys(provider):
+    if provider == "groq":
+        return _collect_keys("GROQ_API_KEY", "GROQ_API_KEYS")
+    if provider == "gemini":
+        return _collect_keys("GOOGLE_API_KEY", "GOOGLE_API_KEYS")
+    if provider == "mistral":
+        return _collect_keys("MISTRAL_API_KEY", "MISTRAL_API_KEYS")
+    raise ValueError(f"Unknown provider: {provider}")
+
+
+class ApiKeyPool:
+    """Round-robin key pool with per-(key, model) daily-quota blacklisting."""
+
+    def __init__(self, provider):
+        self.provider = provider
+        self.keys = load_provider_keys(provider)
+        self._idx = 0
+        self._lock = threading.Lock()
+        # (key, model) pairs that hit daily quota
+        self._daily_exhausted = set()
+
+    def available(self, model):
+        return [k for k in self.keys if (k, model) not in self._daily_exhausted]
+
+    def acquire(self, model, reason=None):
+        """Return the next usable key (round-robin), or None if all exhausted."""
+        with self._lock:
+            if not self.keys:
+                return None
+            usable_n = len(self.available(model))
+            if usable_n == 0:
+                return None
+            for _ in range(len(self.keys)):
+                key = self.keys[self._idx % len(self.keys)]
+                self._idx = (self._idx + 1) % len(self.keys)
+                if (key, model) not in self._daily_exhausted:
+                    if reason:
+                        print(f"  [{self.provider}] {reason}; using key {_mask_key(key)} "
+                              f"({usable_n} keys usable for this model)")
+                    return key
+            return None
+
+    def mark_daily_exhausted(self, key, model):
+        with self._lock:
+            self._daily_exhausted.add((key, model))
+            left = len(self.available(model))
+            print(f"  [{self.provider}] daily quota hit on key {_mask_key(key)} "
+                  f"for model '{model}' -- {left} key(s) left for this model")
+            return left
+
+    def summary(self):
+        return f"{len(self.keys)} key(s) loaded for {self.provider}"
+
+
+_POOLS = {}
+_POOLS_LOCK = threading.Lock()
+
+
+def get_key_pool(provider):
+    with _POOLS_LOCK:
+        pool = _POOLS.get(provider)
+        if pool is None:
+            pool = ApiKeyPool(provider)
+            _POOLS[provider] = pool
+            if pool.keys:
+                print(f"  [{provider}] loaded {len(pool.keys)} API key(s) for rotation: "
+                      + ", ".join(_mask_key(k) for k in pool.keys))
+        return pool
+
+
+def reset_key_pools():
+    """Test helper / force reload after editing env vars mid-process."""
+    with _POOLS_LOCK:
+        _POOLS.clear()
 
 
 def _is_daily_quota_error(resp_text):
     t = resp_text.lower()
     return ("tokens per day" in t or "requests per day" in t
-            or " tpd" in t or " rpd" in t or "daily" in t)
-
-
-def _call_mistral(
-    prompt,
-    model=DEFAULT_MISTRAL_MODEL,
-    temperature=0.2,
-    max_tokens=2048,
-    retries=3,
-):
-    """Call Mistral using the thread-safe multi-key pool.
-
-    Behavior:
-
-    - Round-robin across configured keys.
-    - Rotate immediately on short-lived 429.
-    - Mark a key exhausted for the requested model on daily quota.
-    - Continue with remaining keys.
-    - Raise DailyQuotaExceeded only when all keys are exhausted.
-    """
-
-    pool = get_key_pool(
-        "mistral"
-    )
-
-    if not pool.keys:
-
-        raise LLMError(
-            "No Mistral API keys found. "
-            "Set MISTRAL_API_KEY and/or "
-            "MISTRAL_API_KEYS "
-            "(comma-separated) in .env."
-        )
-
-    body = {
-
-        "model":
-            model,
-
-        "messages": [
-            {
-                "role":
-                    "user",
-
-                "content":
-                    prompt,
-            }
-        ],
-
-        "temperature":
-            temperature,
-
-        "max_tokens":
-            max_tokens,
-    }
-
-    # One attempt per key, plus additional
-    # complete rotations.
-
-    max_attempts = max(
-        retries * max(1, len(pool.keys)),
-        len(pool.keys),
-    )
-
-    last_err = None
-
-    keys_tried_this_cycle = set()
-
-    for attempt in range(
-        max_attempts
-    ):
-
-        reason = (
-            "rate limited"
-            if keys_tried_this_cycle
-            else None
-        )
-
-        api_key = pool.acquire(
-            model,
-            reason=reason,
-        )
-
-        if not api_key:
-
-            raise DailyQuotaExceeded(
-
-                "All Mistral API keys exhausted "
-                f"daily quota for model '{model}'. "
-                "Add more keys to MISTRAL_API_KEYS "
-                "or wait for quota reset."
-            )
-
-        headers = {
-
-            "Authorization":
-                f"Bearer {api_key}",
-
-            "Content-Type":
-                "application/json",
-        }
-
-        try:
-
-            resp = requests.post(
-
-                MISTRAL_URL,
-
-                headers=headers,
-
-                json=body,
-
-                timeout=90,
-            )
-
-        except requests.RequestException as exc:
-
-            last_err = str(exc)
-
-            # Network errors should allow another
-            # configured key to be attempted.
-
-            keys_tried_this_cycle.add(
-                api_key
-            )
-
-            continue
-
-        # ====================================================
-        # SUCCESS
-        # ====================================================
-
-        if resp.status_code == 200:
-
-            try:
-
-                data = resp.json()
-
-                content = (
-                    data["choices"][0]
-                    ["message"]["content"]
-                )
-
-            except (
-                KeyError,
-                IndexError,
-                TypeError,
-                ValueError,
-            ) as exc:
-
-                raise LLMError(
-                    "Mistral returned an unexpected "
-                    f"response format: {exc}"
-                )
-
-            if not content:
-
-                finish_reason = (
-                    data["choices"][0]
-                    .get(
-                        "finish_reason"
-                    )
-                )
-
-                raise LLMError(
-                    "Mistral returned empty content "
-                    f"(finish_reason={finish_reason})"
-                )
-
-            return content
-
-        # ====================================================
-        # RATE LIMIT / QUOTA
-        # ====================================================
-
-        if resp.status_code == 429:
-
-            last_err = resp.text
-
-            # ------------------------------------------------
-            # Daily quota
-            # ------------------------------------------------
-
-            if _is_daily_quota_error(
-                resp.text
-            ):
-
-                left = (
-                    pool.mark_daily_exhausted(
-                        api_key,
-                        model,
-                    )
-                )
-
-                if left == 0:
-
-                    raise DailyQuotaExceeded(
-
-                        "All Mistral API keys exhausted "
-                        f"daily quota for model '{model}': "
-                        f"{resp.text}"
-                    )
-
-                # Try next key immediately.
-
-                keys_tried_this_cycle.clear()
-
-                continue
-
-            # ------------------------------------------------
-            # Short-lived rate limit
-            # ------------------------------------------------
-
-            keys_tried_this_cycle.add(
-                api_key
-            )
-
-            usable = pool.available(
-                model
-            )
-
-            if (
-                len(keys_tried_this_cycle)
-                >= len(usable)
-                and len(usable) > 0
-            ):
-
-                wait = min(
-                    3,
-                    1
-                    + attempt
-                    // max(
-                        1,
-                        len(usable),
-                    ),
-                )
-
-                print(
-                    f"  [mistral] all "
-                    f"{len(usable)} key(s) "
-                    f"rate-limited once; "
-                    f"brief wait {wait}s..."
-                )
-
-                time.sleep(
-                    wait
-                )
-
-                keys_tried_this_cycle.clear()
-
-            continue
-
-        # ====================================================
-        # OTHER API ERROR
-        # ====================================================
-
-        raise LLMError(
-
-            "Mistral API error "
-            f"{resp.status_code}: "
-            f"{resp.text}"
-        )
-
-    raise LLMError(
-
-        "Mistral API failed after "
-        f"{max_attempts} attempts: "
-        f"{last_err}"
-    )
+            or " tpd" in t or " rpd" in t or "daily" in t
+            or "quota exceeded" in t or "exceeded your current quota" in t)
 
 
 def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=2048, retries=3):
     """
-    BUGFIX: openai/gpt-oss-20b and gpt-oss-120b are reasoning models. On Groq
-    they spend part of the token budget on hidden chain-of-thought (returned
-    separately in a `reasoning` field), and only write the final answer into
-    `content` once reasoning finishes. With a low max_tokens and no cap on
-    reasoning effort, the model can burn the ENTIRE budget on reasoning and
-    never get to write `content` at all -- which returns as "", not
-    malformed JSON. That's why extract_json_object was getting a bare empty
-    string for these models specifically.
-
-    Fix: explicitly cap reasoning_effort="low" for gpt-oss models (Groq
-    supports low/medium/high, see console.groq.com/docs/reasoning) so less
-    of the budget goes to hidden thinking, and raise the default max_tokens
-    as a safety margin. qwen models use reasoning_effort differently
-    (none/default) so we don't set it for those.
+    openai/gpt-oss-* are reasoning models on Groq: they spend part of the
+    token budget on hidden chain-of-thought. Cap reasoning_effort="low" so
+    content is not empty.
     """
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise LLMError("GROQ_API_KEY is not set. Get a free key at https://console.groq.com")
+    pool = get_key_pool("groq")
+    if not pool.keys:
+        raise LLMError(
+            "No Groq API keys found. Set GROQ_API_KEY and/or GROQ_API_KEYS "
+            "(comma-separated) in .env. Get free keys at https://console.groq.com"
+        )
 
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -351,17 +193,27 @@ def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=204
     if "gpt-oss" in model:
         body["reasoning_effort"] = "low"
 
+    # Allow one attempt per key, then a couple of full rotations for RPM 429s.
+    max_attempts = max(retries * max(1, len(pool.keys)), len(pool.keys))
     last_err = None
-    for attempt in range(retries):
+    keys_tried_this_cycle = set()
+
+    for attempt in range(max_attempts):
+        reason = "rate limited" if keys_tried_this_cycle else None
+        api_key = pool.acquire(model, reason=reason)
+        if not api_key:
+            raise DailyQuotaExceeded(
+                f"All Groq API keys exhausted daily quota for model '{model}'. "
+                f"Add more keys to GROQ_API_KEYS or wait for reset."
+            )
+
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=60)
+
         if resp.status_code == 200:
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
             if not content:
-                # Content came back genuinely empty -- almost always means
-                # reasoning consumed the whole max_tokens budget for a
-                # gpt-oss model. Surface this distinctly from a normal parse
-                # failure so it's easy to diagnose from the failures log.
                 finish_reason = data["choices"][0].get("finish_reason")
                 reasoning_preview = (data["choices"][0]["message"].get("reasoning") or "")[:200]
                 raise LLMError(
@@ -371,31 +223,40 @@ def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=204
                     f"further. Reasoning preview: {reasoning_preview!r}"
                 )
             return content
+
         if resp.status_code == 429:
-            if _is_daily_quota_error(resp.text):
-                # This is a per-day cap (e.g. "100000 tokens per day" for this
-                # specific model). Waiting 5-15s will never fix it -- fail
-                # immediately instead of burning 3 useless retries.
-                raise DailyQuotaExceeded(
-                    f"Groq daily quota exhausted for model '{model}': {resp.text}"
-                )
-            # Genuine short-lived per-minute rate limit -- backoff is worth it.
-            wait = 5 * (attempt + 1)
-            print(f"  [groq] rate limited, waiting {wait}s...")
-            time.sleep(wait)
             last_err = resp.text
+            if _is_daily_quota_error(resp.text):
+                left = pool.mark_daily_exhausted(api_key, model)
+                if left == 0:
+                    raise DailyQuotaExceeded(
+                        f"All Groq API keys exhausted daily quota for model '{model}': {resp.text}"
+                    )
+                keys_tried_this_cycle.clear()
+                continue
+
+            # Short-lived per-minute limit: rotate key immediately instead of sleeping.
+            keys_tried_this_cycle.add(api_key)
+            usable = pool.available(model)
+            if len(keys_tried_this_cycle) >= len(usable) and len(usable) > 0:
+                wait = min(3, 1 + attempt // max(1, len(usable)))
+                print(f"  [groq] all {len(usable)} key(s) rate-limited once; brief wait {wait}s...")
+                time.sleep(wait)
+                keys_tried_this_cycle.clear()
             continue
+
         raise LLMError(f"Groq API error {resp.status_code}: {resp.text}")
 
-    raise LLMError(f"Groq API failed after {retries} retries: {last_err}")
-
-
+    raise LLMError(f"Groq API failed after {max_attempts} attempts: {last_err}")
 
 
 def _call_gemini(prompt, model=DEFAULT_GEMINI_MODEL, temperature=0.2, max_tokens=1536, retries=3):
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise LLMError("GOOGLE_API_KEY is not set. Get a free key at https://aistudio.google.com")
+    pool = get_key_pool("gemini")
+    if not pool.keys:
+        raise LLMError(
+            "No Gemini API keys found. Set GOOGLE_API_KEY and/or GOOGLE_API_KEYS "
+            "in .env. Get free keys at https://aistudio.google.com"
+        )
 
     url = GEMINI_URL_TMPL.format(model=model)
     body = {
@@ -403,56 +264,185 @@ def _call_gemini(prompt, model=DEFAULT_GEMINI_MODEL, temperature=0.2, max_tokens
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
 
+    max_attempts = max(retries * max(1, len(pool.keys)), len(pool.keys))
     last_err = None
-    for attempt in range(retries):
+    keys_tried_this_cycle = set()
+
+    for attempt in range(max_attempts):
+        reason = "rate limited" if keys_tried_this_cycle else None
+        api_key = pool.acquire(model, reason=reason)
+        if not api_key:
+            raise DailyQuotaExceeded(
+                f"All Gemini API keys exhausted daily quota for model '{model}'. "
+                f"Add more keys to GOOGLE_API_KEYS or wait for reset."
+            )
+
         resp = requests.post(url, params={"key": api_key}, json=body, timeout=60)
         if resp.status_code == 200:
             data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"]
+
         if resp.status_code == 429:
-            if _is_daily_quota_error(resp.text):
-                raise DailyQuotaExceeded(
-                    f"Gemini daily quota exhausted for model '{model}': {resp.text}"
-                )
-            wait = 5 * (attempt + 1)
-            print(f"  [gemini] rate limited, waiting {wait}s...")
-            time.sleep(wait)
             last_err = resp.text
+            if _is_daily_quota_error(resp.text):
+                left = pool.mark_daily_exhausted(api_key, model)
+                if left == 0:
+                    raise DailyQuotaExceeded(
+                        f"All Gemini API keys exhausted daily quota for model '{model}': {resp.text}"
+                    )
+                keys_tried_this_cycle.clear()
+                continue
+
+            keys_tried_this_cycle.add(api_key)
+            usable = pool.available(model)
+            if len(keys_tried_this_cycle) >= len(usable) and len(usable) > 0:
+                wait = min(3, 1 + attempt // max(1, len(usable)))
+                print(f"  [gemini] all {len(usable)} key(s) rate-limited once; brief wait {wait}s...")
+                time.sleep(wait)
+                keys_tried_this_cycle.clear()
             continue
+
         raise LLMError(f"Gemini API error {resp.status_code}: {resp.text}")
 
-    raise LLMError(f"Gemini API failed after {retries} retries: {last_err}")
+    raise LLMError(f"Gemini API failed after {max_attempts} attempts: {last_err}")
+def _call_mistral(
+    prompt,
+    model=DEFAULT_MISTRAL_MODEL,
+    temperature=0.2,
+    max_tokens=2048,
+    retries=3,
+):
+    pool = get_key_pool("mistral")
 
+    if not pool.keys:
+        raise LLMError(
+            "No Mistral API keys found. Set MISTRAL_API_KEY and/or "
+            "MISTRAL_API_KEYS in .env."
+        )
 
-def call_llm(prompt, provider="mistral", model=None, temperature=0.2, max_tokens=1536):
-    """Unified entry point. provider in {'mistral', 'groq', 'gemini'}."""
-    if provider == "mistral":
-        return _call_mistral(prompt, model=model or DEFAULT_MISTRAL_MODEL,
-                              temperature=temperature, max_tokens=max_tokens)
+    body = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    max_attempts = max(
+        retries * max(1, len(pool.keys)),
+        len(pool.keys),
+    )
+
+    last_err = None
+    keys_tried_this_cycle = set()
+
+    for attempt in range(max_attempts):
+        reason = "rate limited" if keys_tried_this_cycle else None
+
+        api_key = pool.acquire(model, reason=reason)
+
+        if not api_key:
+            raise DailyQuotaExceeded(
+                f"All Mistral API keys exhausted daily quota "
+                f"for model '{model}'. "
+                f"Add more keys to MISTRAL_API_KEYS or wait for reset."
+            )
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        resp = requests.post(
+            MISTRAL_URL,
+            headers=headers,
+            json=body,
+            timeout=60,
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+
+            content = data["choices"][0]["message"]["content"]
+
+            if not content:
+                raise LLMError(
+                    "Mistral returned empty content."
+                )
+
+            return content
+
+        if resp.status_code == 429:
+            last_err = resp.text
+
+            if _is_daily_quota_error(resp.text):
+                left = pool.mark_daily_exhausted(api_key, model)
+
+                if left == 0:
+                    raise DailyQuotaExceeded(
+                        f"All Mistral API keys exhausted daily quota "
+                        f"for model '{model}': {resp.text}"
+                    )
+
+                keys_tried_this_cycle.clear()
+                continue
+
+            # Temporary rate limit -> rotate key
+            keys_tried_this_cycle.add(api_key)
+
+            usable = pool.available(model)
+
+            if (
+                len(keys_tried_this_cycle) >= len(usable)
+                and len(usable) > 0
+            ):
+                wait = min(
+                    3,
+                    1 + attempt // max(1, len(usable))
+                )
+
+                print(
+                    f"  [mistral] all {len(usable)} key(s) "
+                    f"rate-limited once; brief wait {wait}s..."
+                )
+
+                time.sleep(wait)
+                keys_tried_this_cycle.clear()
+
+            continue
+
+        raise LLMError(
+            f"Mistral API error {resp.status_code}: {resp.text}"
+        )
+
+    raise LLMError(
+        f"Mistral API failed after {max_attempts} attempts: {last_err}"
+    )
+
+def call_llm(prompt, provider="groq", model=None, temperature=0.2, max_tokens=1536):
+    """Unified entry point. provider in {'groq', 'gemini'}."""
     if provider == "groq":
         return _call_groq(prompt, model=model or DEFAULT_GROQ_MODEL,
                            temperature=temperature, max_tokens=max_tokens)
-    if provider == "gemini":
+    elif provider == "gemini":
         return _call_gemini(prompt, model=model or DEFAULT_GEMINI_MODEL,
                              temperature=temperature, max_tokens=max_tokens)
-    raise ValueError(f"Unknown provider: {provider}")
+    elif provider == "mistral":
+        return _call_mistral(prompt, model=model or DEFAULT_MISTRAL_MODEL,
+                             temperature=temperature, max_tokens=max_tokens)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
 
 def extract_json_object(text):
     """
-    Same robust extraction logic as dt_code/llm_response_processing/response_preprocess.py
-    -- handles raw JSON, ```json fenced blocks, or JSON embedded in extra text.
-
-    BUGFIX: reasoning models (e.g. qwen/qwen3.6-27b) wrap their answer in
-    <think>...</think> before the actual JSON. Their thinking text very often
-    contains stray '{'/'}' characters -- e.g. when the model quotes the
-    Response_Format template back to itself while reasoning about it, or
-    writes example JSON mid-thought. The old greedy regex (searching from the
-    first '{' to the last '}') would match from the FIRST '{' anywhere in
-    the text (often inside
-    <think>) to the LAST '}' (the real answer), swallowing everything in
-    between into one invalid blob. Stripping <think> blocks first removes
-    that noise before the regex ever runs.
+    Robust JSON extraction -- handles raw JSON, ```json fences, or JSON
+    embedded in extra text. Strips <think>...</think> reasoning blocks first
+    so stray braces inside thoughts cannot break the greedy regex.
     """
     if not text:
         return None
@@ -460,9 +450,6 @@ def extract_json_object(text):
         return text
 
     s = text.strip()
-
-    # Strip <think>...</think> reasoning blocks (case-insensitive, may span
-    # multiple lines) before attempting any parse below.
     s = re.sub(r"<think>[\s\S]*?</think>", "", s, flags=re.IGNORECASE).strip()
 
     try:
@@ -492,12 +479,15 @@ def extract_json_object(text):
 
     return None
 
+
 if __name__ == "__main__":
-    # Quick manual smoke test -- only runs real network calls if GROQ_API_KEY is set.
-    if os.environ.get("GROQ_API_KEY"):
+    from utils.env_loader import load_env
+    load_env()
+    pool = get_key_pool("groq")
+    print(pool.summary())
+    if pool.keys:
         out = call_llm("Reply with exactly this JSON: {\"ok\": true}")
         print("Groq response:", out)
         print("Parsed:", extract_json_object(out))
     else:
-        print("GROQ_API_KEY not set -- skipping live call. "
-              "Get a free key at https://console.groq.com and set it to test.")
+        print("No GROQ keys set -- skipping live call.")

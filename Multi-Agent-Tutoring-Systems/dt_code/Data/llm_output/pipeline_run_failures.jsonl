@@ -1,0 +1,2 @@
+{"id": 84, "stage": "student", "raw": "{\"CANDIDATES\":[\"((-S+D)+I) -> (-S+D) - Simplification reduces conjunction, getting a useful component\",\"((-S+D)+I) -> -S - Directly provides needed premise for implication, but requires two simplifications\",\"-S -> (-S+Q) - Adds Q to form antecedent of given implication, moving toward Y\"]}"}
+{"id": 48, "stage": "student", "raw": "{\"CANDIDATES\":[\"(-R+N) - Add from -R\",\"(-R+N) - Add from (-T*S)\"]}"}
