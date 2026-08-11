@@ -163,9 +163,13 @@ def compute_metrics(traces):
     }
 
 
-DEFAULT_PROVIDER = "mistral"
+"""DEFAULT_PROVIDER = "mistral"
 DEFAULT_STUDENT_MODEL = "mistral-large-latest"
-DEFAULT_TUTOR_MODEL = "mistral-large-latest"
+DEFAULT_TUTOR_MODEL = "mistral-large-latest"""
+
+DEFAULT_PROVIDER = "groq"
+DEFAULT_STUDENT_MODEL = "llama-3.1-8b-instant"
+DEFAULT_TUTOR_MODEL = "llama-3.1-8b-instant"
 
 DEBUG_PATH = None  # set in main()
 

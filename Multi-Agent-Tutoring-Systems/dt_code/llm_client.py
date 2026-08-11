@@ -1,26 +1,4 @@
-"""
-llm_client.py
-
-Thin, dependency-light wrapper around two FREE hosted LLM APIs:
-  - Groq   (https://console.groq.com)
-  - Gemini (https://aistudio.google.com)
-
-Supports multiple API keys so long runs (e.g. all 516 proof states) can keep
-going without waiting for a single key's rate/daily quota to reset.
-
-Put keys in `.env` as either:
-    GROQ_API_KEY=key1
-    GROQ_API_KEYS=key2,key3          # comma/whitespace-separated extras
-    GROQ_API_KEY_2=...               # or numbered keys
-    GROQ_API_KEY_3=...
-
-Same pattern for Gemini: GOOGLE_API_KEY / GOOGLE_API_KEYS / GOOGLE_API_KEY_N.
-
-On a short-lived 429, the client rotates to the next key immediately.
-On a daily quota hit for one key+model, that key is marked exhausted for that
-model and the next key is tried. Only when every key is exhausted does the
-caller see DailyQuotaExceeded.
-"""
+#llm_client.py
 
 import os
 import re
@@ -28,6 +6,8 @@ import time
 import json
 import threading
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -171,11 +151,57 @@ def _is_daily_quota_error(resp_text):
             or "quota exceeded" in t or "exceeded your current quota" in t)
 
 
+def _parse_duration_to_seconds(s):
+    """Parse Groq's reset-header format ('7.66s', '2m59.56s', '1h2m3s') to float seconds."""
+    if s is None:
+        return None
+    s = str(s).strip()
+    # Plain float/int seconds (e.g. retry-after: "2")
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    total = 0.0
+    for value, unit in re.findall(r"([\d.]+)\s*(h|m|s)", s):
+        value = float(value)
+        if unit == "h":
+            total += value * 3600
+        elif unit == "m":
+            total += value * 60
+        else:
+            total += value
+    return total if total > 0 else None
+
+
+def _rate_limit_wait_seconds(resp, default=5.0, cap=75.0):
+    """
+    Groq tells you exactly how long to wait -- use that instead of guessing.
+    Prefers `retry-after`, falls back to `x-ratelimit-reset-tokens` (TPM window,
+    almost always the actual bottleneck for reasoning models), then a default.
+    Capped so a bad/huge header can't stall a run for an unreasonable time.
+    """
+    wait = _parse_duration_to_seconds(resp.headers.get("retry-after"))
+    if wait is None:
+        wait = _parse_duration_to_seconds(resp.headers.get("x-ratelimit-reset-tokens"))
+    if wait is None:
+        wait = default
+    return min(max(wait, 0.5) + 0.5, cap)  # small buffer past the reset boundary, then cap
+
+
 def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=2048, retries=3):
     """
     openai/gpt-oss-* are reasoning models on Groq: they spend part of the
     token budget on hidden chain-of-thought. Cap reasoning_effort="low" so
     content is not empty.
+
+    NOTE: Groq rate limits (RPM/TPM/RPD/TPD) apply at the ORGANIZATION level,
+    not per API key -- if all your keys belong to the same Groq account, they
+    share one bucket and rotating between them does not raise your effective
+    throughput. Multiple keys still help if they genuinely belong to
+    different accounts, or as a fallback once one key's *daily* quota
+    (RPD/TPD) is separately exhausted. For the common per-minute (RPM/TPM)
+    429s, the fix is pacing correctly using the response headers below, not
+    key-switching.
     """
     pool = get_key_pool("groq")
     if not pool.keys:
@@ -189,6 +215,14 @@ def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=204
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        # Groq's JSON Object Mode guarantees syntactically valid JSON output
+        # (it 400s instead of returning prose) as long as the prompt itself
+        # says "JSON" somewhere -- your prompts.py already does via
+        # Response_Format. This is what actually fixes "could not be parsed"
+        # failures; smaller/instant models are far less reliable than
+        # gpt-oss-20b about following a plain-English "respond with only
+        # JSON" instruction on their own.
+        "response_format": {"type": "json_object"},
     }
     if "gpt-oss" in model:
         body["reasoning_effort"] = "low"
@@ -222,6 +256,18 @@ def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=204
                     f"final answer. Consider raising max_tokens or lowering reasoning_effort "
                     f"further. Reasoning preview: {reasoning_preview!r}"
                 )
+            # Proactively pace if we're about to run out of TPM budget for
+            # this model, so the *next* call doesn't just 429 immediately.
+            remaining_tokens = resp.headers.get("x-ratelimit-remaining-tokens")
+            try:
+                remaining_tokens = int(remaining_tokens) if remaining_tokens is not None else None
+            except ValueError:
+                remaining_tokens = None
+            if remaining_tokens is not None and remaining_tokens < max_tokens:
+                wait = _rate_limit_wait_seconds(resp, default=5.0, cap=65.0)
+                print(f"  [groq] only {remaining_tokens} tokens left in this minute's budget "
+                      f"for '{model}'; pausing {wait:.1f}s before the next call...")
+                time.sleep(wait)
             return content
 
         if resp.status_code == 429:
@@ -235,13 +281,16 @@ def _call_groq(prompt, model=DEFAULT_GROQ_MODEL, temperature=0.2, max_tokens=204
                 keys_tried_this_cycle.clear()
                 continue
 
-            # Short-lived per-minute limit: rotate key immediately instead of sleeping.
+            # Short-lived per-minute (RPM/TPM) limit. Since keys on the same
+            # org share one bucket, cycling through them fast just wastes
+            # attempts -- wait out the window Groq actually reports instead.
             keys_tried_this_cycle.add(api_key)
             usable = pool.available(model)
+            wait = _rate_limit_wait_seconds(resp)
+            print(f"  [groq] rate limited on key {_mask_key(api_key)} for '{model}'; "
+                  f"waiting {wait:.1f}s (per Groq's reported reset window)...")
+            time.sleep(wait)
             if len(keys_tried_this_cycle) >= len(usable) and len(usable) > 0:
-                wait = min(3, 1 + attempt // max(1, len(usable)))
-                print(f"  [groq] all {len(usable)} key(s) rate-limited once; brief wait {wait}s...")
-                time.sleep(wait)
                 keys_tried_this_cycle.clear()
             continue
 
