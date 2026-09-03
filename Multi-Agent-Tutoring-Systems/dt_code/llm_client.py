@@ -17,6 +17,12 @@ DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_MISTRAL_MODEL = "mistral-large-latest"
 
+# No external API, no quota, no rate limits -- runs on whatever GPU is
+# available in the current process (Kaggle T4/P100, HF Space GPU, etc).
+# Qwen2.5-7B-Instruct is open (no gated-access approval needed, unlike
+# Llama) and fits comfortably on a single 16GB T4 in fp16/bf16 (or 4-bit).
+DEFAULT_LOCAL_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+
 
 class LLMError(Exception):
     pass
@@ -472,8 +478,112 @@ def _call_mistral(
         f"Mistral API failed after {max_attempts} attempts: {last_err}"
     )
 
+
+# --------------------------------------------------------------------------
+# Local provider -- runs an open model in-process via `transformers`, on
+# whatever GPU/CPU is available. No API key, no quota, no rate limit. This
+# is the option to use on Kaggle/HF free-GPU notebooks so a full run can
+# finish in one session instead of being capped by a provider's daily quota.
+# --------------------------------------------------------------------------
+
+_LOCAL_MODELS = {}          # model_name -> (tokenizer, model)
+_LOCAL_LOCK = threading.Lock()
+
+
+def _load_local_model(model_name, load_in_4bit=None):
+    """Lazily load + cache a HF model/tokenizer. Reused across all calls in
+    the process so the (slow) load only happens once per model name."""
+    with _LOCAL_LOCK:
+        if model_name in _LOCAL_MODELS:
+            return _LOCAL_MODELS[model_name]
+
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as e:
+            raise LLMError(
+                "Local provider requires `torch` and `transformers`. Install with:\n"
+                "  pip install torch transformers accelerate bitsandbytes\n"
+                f"(original error: {e})"
+            )
+
+        if load_in_4bit is None:
+            # Auto-decide: quantize to 4-bit if we're on a small (<20GB) GPU,
+            # e.g. a Kaggle T4, so a 7B model fits with headroom. Skip
+            # quantization on CPU-only or big-GPU boxes.
+            load_in_4bit = False
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                load_in_4bit = total_gb < 20
+
+        print(f"  [local] loading {model_name} "
+              f"({'4-bit' if load_in_4bit else 'fp16/bf16' if torch.cuda.is_available() else 'cpu'})"
+              f" -- first call only, this can take a couple of minutes...")
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        model_kwargs = {"device_map": "auto"}
+        if load_in_4bit:
+            try:
+                from transformers import BitsAndBytesConfig
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_quant_type="nf4",
+                )
+            except ImportError:
+                raise LLMError(
+                    "4-bit loading requires `bitsandbytes`. Install with: "
+                    "pip install bitsandbytes"
+                )
+        elif torch.cuda.is_available():
+            model_kwargs["torch_dtype"] = torch.bfloat16
+
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        model.eval()
+
+        _LOCAL_MODELS[model_name] = (tokenizer, model)
+        return tokenizer, model
+
+
+def _call_local(prompt, model=DEFAULT_LOCAL_MODEL, temperature=0.2, max_tokens=2048):
+    import torch
+
+    tokenizer, hf_model = _load_local_model(model)
+
+    messages = [{"role": "user", "content": prompt}]
+    # return_dict=True is the robust form across transformers versions --
+    # some versions return a raw tensor for return_tensors="pt", others
+    # return a BatchEncoding/dict. Requesting the dict explicitly avoids
+    # that ambiguity (fixes "AttributeError: shape" on newer versions).
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    )
+    encoded = {k: v.to(hf_model.device) for k, v in encoded.items()}
+    input_len = encoded["input_ids"].shape[1]
+
+    with torch.no_grad():
+        output_ids = hf_model.generate(
+            **encoded,
+            max_new_tokens=max_tokens,
+            do_sample=temperature > 0,
+            temperature=max(temperature, 0.01),
+            top_p=0.95,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+
+    new_tokens = output_ids[0][input_len:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    if not text.strip():
+        raise LLMError("Local model returned empty content.")
+    return text
+
+
 def call_llm(prompt, provider="groq", model=None, temperature=0.2, max_tokens=1536):
-    """Unified entry point. provider in {'groq', 'gemini'}."""
+    """Unified entry point. provider in {'groq', 'gemini', 'mistral', 'local'}."""
     if provider == "groq":
         return _call_groq(prompt, model=model or DEFAULT_GROQ_MODEL,
                            temperature=temperature, max_tokens=max_tokens)
@@ -483,6 +593,9 @@ def call_llm(prompt, provider="groq", model=None, temperature=0.2, max_tokens=15
     elif provider == "mistral":
         return _call_mistral(prompt, model=model or DEFAULT_MISTRAL_MODEL,
                              temperature=temperature, max_tokens=max_tokens)
+    elif provider == "local":
+        return _call_local(prompt, model=model or DEFAULT_LOCAL_MODEL,
+                            temperature=temperature, max_tokens=max_tokens)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

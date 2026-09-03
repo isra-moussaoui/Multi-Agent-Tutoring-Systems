@@ -45,7 +45,7 @@ DEFAULT_STUDENT_MODEL = "mistral-large-latest"
 DEFAULT_TUTOR_MODEL = "mistral-large-latest"
 DEFAULT_VERIFIER_MODEL = "mistral-large-latest"
 DEFAULT_RECOVERY_MODEL = "mistral-large-latest"
-_PROVIDER_CHOICES = ["mistral", "groq", "gemini"]
+_PROVIDER_CHOICES = ["mistral", "groq", "gemini",]
 
 
 def _trace_from_graph_result(row, student_parsed, gt_label, result: dict) -> dict:
