@@ -1,32 +1,6 @@
 """
 run_baseline.py
 
-Step 2 (get data) + Step 3 (build the single-agent baseline) from the brief,
-all free and CPU-only:
-
-  1. Load Data/cleaned_data/preState.jsonl (517 real proof states).
-  2. Take a stratified sample across the 32 problems.
-  3. For each sampled state:
-       a. STUDENT (LLM call): generate a next step, blind -- same as the
-          original repo's student_prompt.
-       b. Ground truth label for that step, computed 100% locally via
-          kg_local.py (no Neo4j, no API cost): "optimal" / "valid_alternative"
-          / "incorrect".
-       c. TUTOR (LLM call): blind_tutor_prompt grades the student's step
-          WITHOUT seeing the ground truth -- this is the single-agent
-          baseline/control group from the brief's Step 3.
-  4. Save the full trace to Data/llm_output/baseline_run.jsonl.
-  5. Print over-validation rate / over-rejection rate: does the single Tutor
-     agree with the LLM student even when the student's step was actually
-     wrong (over-validation), or reject it even when it was actually valid
-     (over-rejection)?
-
-Usage:
-    export GROQ_API_KEY=your_free_key_here
-    python run_baseline.py --n 100
-
-Only two dependencies beyond the standard library: `requests` and `pyyaml`
-(both free/open source, `pip install requests pyyaml`).
 """
 
 import argparse

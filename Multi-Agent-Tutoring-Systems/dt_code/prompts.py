@@ -1,26 +1,6 @@
 """
 prompts.py
 
-Loads the ORIGINAL prompt templates straight from the repo
-(dt_code/prompts_i+2/student_prompts.yaml) and reuses them verbatim -- they're
-solid, tested prompt engineering, no reason to rewrite them.
-
-Also defines BLIND_TUTOR_PROMPT: a new prompt for the project's Stage-1 Tutor.
-
-Why a new prompt instead of reusing teacher_prompt.yaml's "teacher_only_prompt"?
-Because that prompt deliberately hands the grader CORRECT_STEP ("You are a
-professor with an access to CORRECT_STEP..."). That's a sighted grader, useful
-for the original paper's questions but NOT what our brief's Stage 1 needs:
-
-    "Input: the problem statement + the student's solution step. (No ground
-    truth -- it has to judge like a real tutor would.)"
-
-A single LLM tutor that's shown the answer key will trivially catch every
-error -- that erases the exact failure mode (over-validation of wrong answers)
-we're trying to measure. So BLIND_TUTOR_PROMPT keeps the same JSON-schema
-style and rule vocabulary as the original teacher prompt, but removes
-CORRECT_STEP and asks the model to work out correctness on its own, the way a
-real single-agent tutor deployed in production would have to.
 """
 
 import yaml

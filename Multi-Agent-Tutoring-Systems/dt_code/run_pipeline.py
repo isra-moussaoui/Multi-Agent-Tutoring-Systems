@@ -23,38 +23,6 @@ Pipeline per sampled proof state:
   6. RECOVERY  (LLM call, only on disagreement): recovery_prompt sees BOTH
                 verdicts + the original problem and produces a tie-broken
                 FINAL_VERDICT, recovery_flag=True.
-
-Recommended default split: everything runs on Groq (Gemini kept as an
-optional --*-provider gemini override, but not the default -- Gemini's free
-tier has been unstable this year, see llm_client.py). Each role still uses a
-DIFFERENT MODEL so no single per-model daily cap on Groq's free tier gets
-hit by all four roles at once, and so the Verifier is a genuinely different
-model family from the Tutor:
-  - Student:  Groq / openai/gpt-oss-20b   (small/fast -> makes realistic mistakes)
-  - Tutor:    Groq / qwen/qwen3.6-27b      (different family from Student)
-  - Verifier: Groq / openai/gpt-oss-120b   (different size from both
-              Student and Tutor -- genuine independence, own quota bucket)
-  - Recovery: Groq / openai/gpt-oss-120b   (only called on disagreements, so
-              it's a small fraction of total calls -- fine to share
-              Verifier's model)
-
-NOTE (Aug 2026): llama-3.1-8b-instant and llama-3.3-70b-versatile are being
-shut down by Groq on 08/16/26 -- don't reintroduce them as defaults even
-though you'll still see them in older examples/blog posts. Check
-https://console.groq.com/docs/deprecations if any model here errors out.
-
-Usage:
-    python run_pipeline.py --n 516 --seed 42
-
-Multiple keys in ../.env (recommended for the full run):
-    GROQ_API_KEY=key1
-    GROQ_API_KEYS=key2,key3
-
-The client rotates keys on rate/daily limits so you do not need long sleeps.
-Same seed + same default models as run_baseline.py for a fair comparison.
-Resume support mirrors run_baseline.py.
-
-(GOOGLE_API_KEY / GOOGLE_API_KEYS only needed if you pass --*-provider gemini.)
 """
 
 import argparse

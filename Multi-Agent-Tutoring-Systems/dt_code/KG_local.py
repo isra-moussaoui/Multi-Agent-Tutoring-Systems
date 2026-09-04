@@ -3,29 +3,6 @@ kg_local.py
 
 Free, local, Neo4j-free replacement for dt_code/KG/KG_create.py + KG_traversal.py.
 
-The original repo builds a knowledge graph in a Neo4j database (one graph per
-propositional-logic problem, e.g. "1.1", "2.3", ...) from Data/props/prop_X.X.csv,
-then runs a BFS over it to check whether a proposed next-step is derivable.
-
-Neo4j adds zero value here: each per-problem graph has a few dozen nodes. This
-module builds the exact same graph as a plain Python dict and runs the exact
-same BFS in memory. No signup, no service, no cost, runs instantly on a CPU.
-
-CSV row format (props/prop_X.X.csv), reproduced from KG_create.py:
-    each row is one example derivation path through the problem, written as
-    comma-separated elements of the form "expression;parents;rule", e.g.
-
-    (A>(B*C));0;Given,(A+D);0;Given,-D;(-D*E);Simplification,...
-
-    - rule == "Given"      -> expression is a starting premise (no parents)
-    - rule == anything else -> expression was derived from the parent
-      expression(s) (dot-separated if more than one) using that rule.
-
-We aggregate every row in a file into one dict:
-    node_derivations = {
-        expression: [ [parent1, parent2, ..., rule], ... ]   # possible derivations
-    }
-A Given node maps to [] (no derivation needed, it's already known).
 """
 
 import csv
